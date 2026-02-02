@@ -1,3 +1,8 @@
+import os
+# 시스템의 프록시 설정을 강제로 무시하게 만듭니다.
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+
 import streamlit as st
 from openai import OpenAI
 import base64
