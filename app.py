@@ -104,6 +104,30 @@ for message in st.session_state.messages:
             else:
                 st.markdown(message["content"])
 
+
+# ---------------------------------------------------------
+# [화면 구성] 예시 질문 버튼 (대화가 없을 때만 표시)
+# ---------------------------------------------------------
+click_button_text = "" # 버튼 클릭 여부를 저장할 변수
+
+if len(st.session_state.messages) == 1:
+    st.markdown("### 🙋‍♀️ 무엇을 도와드릴까요? (예시 질문)")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🔍 진단서의 '침윤성'이 뭐야?", use_container_width=True):
+            click_button_text = "진단서에 적힌 '침윤성'이라는 말이 무슨 뜻인지 쉽게 설명해줘."
+        if st.button("🍣 항암 중에 회 먹어도 돼?", use_container_width=True):
+            click_button_text = "항암 치료 중인데 생선회나 날음식을 먹어도 될까? 안 된다면 왜 안 되는지 설명해줘."
+            
+    with col2:
+        if st.button("🤮 속이 너무 메스꺼워 (부작용)", use_container_width=True):
+            click_button_text = "항암 치료 부작용으로 속이 메스껍고 구토가 나와. 집에서 할 수 있는 완화 방법을 알려줘."
+        if st.button("📊 암 3기 생존율이 궁금해", use_container_width=True):
+            click_button_text = "암 3기 생존율 통계가 궁금해. 그리고 통계보다 더 중요한 마음가짐이 있을까?"
+
+
+
 # 8. 채팅 입력창
 if prompt := st.chat_input("궁금한 의학 용어나 고민을 입력하세요..."):
     with st.chat_message("user"):
@@ -135,3 +159,4 @@ if prompt := st.chat_input("궁금한 의학 용어나 고민을 입력하세요
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
             except Exception as e:
                 st.error(f"오류가 발생했습니다: {str(e)}")
+
