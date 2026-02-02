@@ -10,7 +10,7 @@ import base64
 # 1. 페이지 설정
 st.set_page_config(page_title="수간호사 김보듬", page_icon="🧸", layout="wide")
 
-st.title("🧸 수수간호사 김보듬")
+st.title("🧸 수간호사 김보듬")
 st.caption("암 환자와 보호자를 위한 든든한 방패. 무엇이든 물어보세요.")
 
 # 2. API 키 설정 (중복 제거 및 최적화)
