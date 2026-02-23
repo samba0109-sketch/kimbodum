@@ -8,6 +8,7 @@ from openai import OpenAI
 import base64
 from datetime import datetime  # [추가] 시간 기록을 위한 도구
 from supabase import create_client
+import uuid
 
 # 1. 페이지 설정
 st.set_page_config(page_title="수간호사 김보듬", page_icon="🧸", layout="wide")
@@ -39,8 +40,9 @@ except KeyError:
 def get_or_create_session():
     """세션 ID를 가져오거나 새로 생성"""
     if "session_id" not in st.session_state:
-        result = supabase_client.table("sessions").insert({}).execute()
-        st.session_state.session_id = result.data[0]["id"]
+        session_id = str(uuid.uuid4())
+        supabase_client.table("sessions").insert({"id": session_id}).execute()
+        st.session_state.session_id = session_id
     return st.session_state.session_id
 
 def save_log_to_db(role, content):
