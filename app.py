@@ -6,8 +6,8 @@ os.environ.pop("https_proxy", None)
 import streamlit as st
 from openai import OpenAI
 import base64
-import csv  # [추가] 엑셀 저장을 위한 도구
 from datetime import datetime  # [추가] 시간 기록을 위한 도구
+from supabase import create_client
 
 # 1. 페이지 설정
 st.set_page_config(page_title="수간호사 김보듬", page_icon="🧸", layout="wide")
@@ -24,31 +24,52 @@ except KeyError:
 
 client = OpenAI(api_key=api_key)
 
+# 3. Supabase 클라이언트 설정
+try:
+    supabase_url = st.secrets["supabase"]["url"]
+    supabase_key = st.secrets["supabase"]["key"]
+    supabase_client = create_client(supabase_url, supabase_key)
+except KeyError:
+    st.error("Supabase 설정이 Secrets에 없습니다. 'Manage app -> Settings -> Secrets'를 확인해주세요.")
+    st.stop()
+
 # ---------------------------------------------------------
-# [추가] 데이터 저장 함수 (Input 저장용)
+# 데이터 저장 함수 (Supabase DB 저장용)
 # ---------------------------------------------------------
-def save_log_to_csv(role, content):
-    """채팅 로그를 CSV 파일에 저장"""
-    file_exists = os.path.isfile("chat_logs.csv")
-    
-    with open("chat_logs.csv", mode="a", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file)
-        if not file_exists:
-            writer.writerow(["시간", "역할", "내용"]) # 헤더
-            
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        writer.writerow([timestamp, role, str(content)])
+def get_or_create_session():
+    """세션 ID를 가져오거나 새로 생성"""
+    if "session_id" not in st.session_state:
+        result = supabase_client.table("sessions").insert({}).execute()
+        st.session_state.session_id = result.data[0]["id"]
+    return st.session_state.session_id
+
+def save_log_to_db(role, content):
+    """채팅 로그를 Supabase DB에 저장"""
+    session_id = get_or_create_session()
+    supabase_client.table("chat_logs").insert({
+        "session_id": session_id,
+        "role": role,
+        "content": str(content)
+    }).execute()
 
 def save_uploaded_file(uploaded_file):
-    """업로드된 이미지를 폴더에 저장"""
+    """업로드된 이미지를 폴더에 저장하고 메타데이터를 DB에 기록"""
     if not os.path.exists("saved_images"):
         os.makedirs("saved_images")
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_path = os.path.join("saved_images", f"{timestamp}_{uploaded_file.name}")
-    
+
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
+
+    session_id = get_or_create_session()
+    supabase_client.table("image_uploads").insert({
+        "session_id": session_id,
+        "filename": uploaded_file.name,
+        "file_path": file_path
+    }).execute()
+
     return file_path
 
 # ---------------------------------------------------------
@@ -63,7 +84,7 @@ def click_callback(text_content):
     # 1. 화면에 메시지 추가
     st.session_state.messages.append({"role": "user", "content": text_content})
     # 2. [저장] 파일에 기록
-    save_log_to_csv("user", text_content)
+    save_log_to_db("user", text_content)
 
 # 3. 시스템 프롬프트 (건드리지 않음)
 system_instruction = """
@@ -213,7 +234,7 @@ if len(st.session_state.messages) == 1:
 if prompt := st.chat_input("궁금한 의학 용어나 고민을 입력하세요..."):
     
     # [저장] 사용자 질문 저장
-    save_log_to_csv("user", prompt)
+    save_log_to_db("user", prompt)
 
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -250,7 +271,7 @@ if st.session_state.messages[-1]["role"] == "user":
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
                 
                 # [저장] AI 답변도 로그에 저장 (완벽한 기록을 위해)
-                save_log_to_csv("assistant", full_response)
+                save_log_to_db("assistant", full_response)
                 
             except Exception as e:
                 st.error(f"오류가 발생했습니다: {str(e)}")
