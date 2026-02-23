@@ -9,6 +9,8 @@ import base64
 from datetime import datetime  # [추가] 시간 기록을 위한 도구
 from supabase import create_client
 import uuid
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import SupabaseVectorStore
 
 # 1. 페이지 설정
 st.set_page_config(page_title="수간호사 김보듬", page_icon="🧸", layout="wide")
@@ -34,9 +36,29 @@ except KeyError:
     st.error("Supabase 설정이 Secrets에 없습니다. 'Manage app -> Settings -> Secrets'를 확인해주세요.")
     st.stop()
 
+# 4. LangChain 벡터스토어 초기화 (RAG용)
+embeddings = OpenAIEmbeddings(openai_api_key=api_key, model="text-embedding-3-small")
+vector_store = SupabaseVectorStore(
+    client=supabase_client,
+    embedding=embeddings,
+    table_name="documents",
+    query_name="match_documents",
+)
+
 # ---------------------------------------------------------
 # 데이터 저장 함수 (Supabase DB 저장용)
 # ---------------------------------------------------------
+def retrieve_context(query: str, k: int = 3) -> str:
+    """사용자 질문과 관련된 문서 청크를 검색"""
+    try:
+        docs = vector_store.similarity_search(query, k=k)
+        if not docs:
+            return ""
+        context = "\n\n---\n\n".join([doc.page_content for doc in docs])
+        return f"## 참고 자료 (최신 의료 데이터)\n{context}"
+    except Exception:
+        return ""
+
 def get_or_create_session():
     """세션 ID를 가져오거나 새로 생성"""
     if "session_id" not in st.session_state:
@@ -261,9 +283,18 @@ if st.session_state.messages[-1]["role"] == "user":
         message_placeholder = st.empty()
         with st.spinner("🧸 김보듬 수간호사가 분석 중입니다..."):
             try:
+                # RAG: 마지막 사용자 메시지로 관련 문서 검색
+                last_user_msg = st.session_state.messages[-1]["content"]
+                query_text = last_user_msg if isinstance(last_user_msg, str) else last_user_msg[0]["text"]
+                context = retrieve_context(query_text)
+
+                messages_with_context = list(st.session_state.messages)
+                if context:
+                    messages_with_context.insert(1, {"role": "system", "content": context})
+
                 response = client.chat.completions.create(
                     model="gpt-4o",
-                    messages=st.session_state.messages,
+                    messages=messages_with_context,
                     temperature=0.2,
                 )
                 full_response = response.choices[0].message.content
