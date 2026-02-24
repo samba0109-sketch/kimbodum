@@ -1,42 +1,32 @@
 import os
-# 시스템의 프록시 설정을 강제로 무시하게 만듭니다.
+import uuid
+import calendar
+from datetime import datetime, date, timedelta
+
 os.environ.pop("http_proxy", None)
 os.environ.pop("https_proxy", None)
 
 import streamlit as st
 from openai import OpenAI
-import base64
-from datetime import datetime  # [추가] 시간 기록을 위한 도구
 from supabase import create_client
-import uuid
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 
-# 1. 페이지 설정
-st.set_page_config(page_title="수간호사 김보듬", page_icon="🧸", layout="wide")
+st.set_page_config(page_title="김보듬 케어 대시보드", page_icon="🧸", layout="wide")
 
-st.title("🧸 수간호사 김보듬")
-st.caption("암 환자와 보호자를 위한 든든한 방패. 무엇이든 물어보세요.")
-
-# 2. API 키 설정
+# ── 1. 클라이언트 초기화 ─────────────────────────────────────────────────────
 try:
     api_key = st.secrets["OPENAI_API_KEY"]
-except KeyError:
-    st.error("API 키가 Secrets에 설정되지 않았습니다. 'Manage app -> Settings -> Secrets'를 확인해주세요.")
+    supabase_url = st.secrets["supabase"]["url"]
+    supabase_key = st.secrets["supabase"]["key"]
+    admin_password = st.secrets["admin_password"]
+    patient_info = dict(st.secrets.get("patient", {}))
+except KeyError as e:
+    st.error(f"Secrets 설정이 필요합니다: {e}")
     st.stop()
 
 client = OpenAI(api_key=api_key)
-
-# 3. Supabase 클라이언트 설정
-try:
-    supabase_url = st.secrets["supabase"]["url"]
-    supabase_key = st.secrets["supabase"]["key"]
-    supabase_client = create_client(supabase_url, supabase_key)
-except KeyError:
-    st.error("Supabase 설정이 Secrets에 없습니다. 'Manage app -> Settings -> Secrets'를 확인해주세요.")
-    st.stop()
-
-# 4. LangChain 벡터스토어 초기화 (RAG용)
+supabase_client = create_client(supabase_url, supabase_key)
 embeddings = OpenAIEmbeddings(openai_api_key=api_key, model="text-embedding-3-small")
 vector_store = SupabaseVectorStore(
     client=supabase_client,
@@ -45,11 +35,38 @@ vector_store = SupabaseVectorStore(
     query_name="match_documents",
 )
 
-# ---------------------------------------------------------
-# 데이터 저장 함수 (Supabase DB 저장용)
-# ---------------------------------------------------------
+# ── 2. 시스템 프롬프트 ───────────────────────────────────────────────────────
+system_instruction = """
+## 1. 진단서 및 의학용어 해석 (Deep Interpretation)
+사용자가 용어나 진단서를 물어보면 **단순 사전적 정의**를 넘어 **'임상적 의미'**를 설명하세요.
+
+## 2. 생활 및 식단 가이드 (Contextual Advice)
+"먹어도 돼?"라는 질문에 O/X만 하지 말고 **상황별 판단 기준**을 주세요.
+
+## 3. 커뮤니티 및 정보 연결 (Resource Mapping)
+답변 후, 환자의 질병 코드나 상황에 맞춰 아래 링크를 **반드시** 버튼 형태로 추천해주세요. 한번만 추천하고 이후에는 추천하지 마세요.
+* **담도암:** "👉 [담도암 환우들의 치료 일지 보러가기](https://cafe.naver.com/cholangiocarcinoma2)"
+* **위암 (Stomach Cancer) 관련:** "👉 [위암 환우들의 식단 & 극복 후기 보러가기](https://cafe.naver.com/ilovestomach)"
+* **유방암 (Breast Cancer) 관련:** "👉 [유방암 환우들의 치료 일지 보러가기](https://cafe.naver.com/pinkribbon)"
+* **기타 암/식별 불가:** "👉 [12만 환우들과 소통하러 가기](https://cafe.naver.com/beautifulcompanion)"
+
+# Safety Protocol
+* 당신은 진단(Diagnosis)을 내리는 주체가 아닙니다. 설명 끝에는 항상 **"하지만 정확한 현재 상태는 주치의 선생님의 판단이 가장 중요합니다."**라고 부드럽게 넘겨주세요.
+* 특정 건강기능식품이나 민간요법을 맹신하는 질문에는, 그 위험성을 **과학적 근거**를 들어 단호하게 경고하세요.
+
+# Empathy First
+사용자의 질문에서 **불안, 공포, 지침** 등의 감정이 감지되면, 바로 의학적 정보를 나열하지 말고 먼저 마음을 읽어주세요.
+
+# Red Flag Detection
+만약 질문 내용 중에 **응급 상황(Red Flags)**이 포함되어 있다면, **즉시 응급실 방문을 권유**하세요.
+1. 발열: 체온이 38도 이상일 때
+2. 통증: 갑작스럽고 참을 수 없는 극심한 통증
+3. 호흡: 숨이 차거나 가슴이 답답할 때
+4. 의식: 환자가 쳐지거나 의식이 흐릿할 때
+"""
+
+# ── 3. 핵심 함수 ─────────────────────────────────────────────────────────────
 def retrieve_context(query: str, k: int = 3) -> str:
-    """사용자 질문과 관련된 문서 청크를 검색"""
     try:
         docs = vector_store.similarity_search(query, k=k)
         if not docs:
@@ -60,7 +77,6 @@ def retrieve_context(query: str, k: int = 3) -> str:
         return ""
 
 def get_or_create_session():
-    """세션 ID를 가져오거나 새로 생성"""
     if "session_id" not in st.session_state:
         session_id = str(uuid.uuid4())
         supabase_client.table("sessions").insert({"id": session_id}).execute()
@@ -68,7 +84,6 @@ def get_or_create_session():
     return st.session_state.session_id
 
 def save_log_to_db(role, content):
-    """채팅 로그를 Supabase DB에 저장"""
     session_id = get_or_create_session()
     supabase_client.table("chat_logs").insert({
         "session_id": session_id,
@@ -76,235 +91,445 @@ def save_log_to_db(role, content):
         "content": str(content)
     }).execute()
 
-def save_uploaded_file(uploaded_file):
-    """업로드된 이미지를 폴더에 저장하고 메타데이터를 DB에 기록"""
-    if not os.path.exists("saved_images"):
-        os.makedirs("saved_images")
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_path = os.path.join("saved_images", f"{timestamp}_{uploaded_file.name}")
-
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
-    session_id = get_or_create_session()
-    supabase_client.table("image_uploads").insert({
-        "session_id": session_id,
-        "filename": uploaded_file.name,
-        "file_path": file_path
+def save_daily_record(record_date, caregiver_name, condition_text, pain_score, has_files):
+    result = supabase_client.table("daily_records").insert({
+        "record_date": str(record_date),
+        "caregiver_name": caregiver_name,
+        "condition_text": condition_text,
+        "pain_score": pain_score,
+        "has_files": has_files
     }).execute()
+    return result.data[0]["id"] if result.data else None
 
-    return file_path
+def get_monthly_records(year, month):
+    start = f"{year}-{month:02d}-01"
+    end_year, end_month = (year + 1, 1) if month == 12 else (year, month + 1)
+    end = f"{end_year}-{end_month:02d}-01"
+    result = supabase_client.table("daily_records").select("*").gte("record_date", start).lt("record_date", end).execute()
+    return result.data
 
-# ---------------------------------------------------------
-# [수정] 헬퍼 함수 & 버튼 콜백 (버튼 고장 수리)
-# ---------------------------------------------------------
-def encode_image(uploaded_file):
-    """이미지를 base64로 인코딩"""
-    return base64.b64encode(uploaded_file.read()).decode("utf-8")
+def get_date_record(record_date):
+    result = supabase_client.table("daily_records").select("*").eq("record_date", str(record_date)).order("created_at", desc=True).execute()
+    return result.data
 
-def click_callback(text_content):
-    """버튼 클릭 시 실행되는 함수 (저장 기능 포함)"""
-    # 1. 화면에 메시지 추가
-    st.session_state.messages.append({"role": "user", "content": text_content})
-    # 2. [저장] 파일에 기록
-    save_log_to_db("user", text_content)
+def get_all_records():
+    result = supabase_client.table("daily_records").select("*").order("record_date", desc=True).execute()
+    return result.data
 
-# 3. 시스템 프롬프트 (건드리지 않음)
-system_instruction = """
-## 1. 진단서 및 의학용어 해석 (Deep Interpretation)
-사용자가 용어나 진단서를 물어보면 **단순 사전적 정의**를 넘어 **'임상적 의미'**를 설명하세요.
-* **잘못된 예:** "침윤은 암이 파고드는 것입니다."
-* **올바른 예:** "침윤(Invasive)이라는 단어가 보여 놀라셨죠? 이건 암세포가 제자리에 얌전히 있지 않고, 혈관이나 림프관을 타고 이동할 준비를 마쳤다는 뜻입니다. 그래서 수술 후에도 혹시 모를 씨앗을 없애기 위해 항암 치료가 필요한 경우가 많아요."
+def pain_icon(score):
+    if score is None:
+        return "⬜"
+    if score <= 3:
+        return "🟢"
+    if score <= 6:
+        return "🟡"
+    return "🔴"
 
-## 2. 생활 및 식단 가이드 (Contextual Advice)
-"먹어도 돼?"라는 질문에 O/X만 하지 말고 **상황별 판단 기준**을 주세요.
-* 백혈구 수치가 낮을 때, 간 수치가 높을 때, 수술 직후일 때 등 **전제 조건**을 들어 설명합니다.
-* **Action Tip:** "정 드시고 싶다면 날것보다는 푹 익혀서, 양념은 덜어내고 드세요."처럼 타협 가능한 대안을 제시합니다.
+def send_chat_message(user_input):
+    save_log_to_db("user", user_input)
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    try:
+        context = retrieve_context(user_input)
+        messages_with_context = list(st.session_state.messages)
+        if context:
+            messages_with_context.insert(1, {"role": "system", "content": context})
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages_with_context,
+            temperature=0.2,
+        )
+        full_response = response.choices[0].message.content
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        save_log_to_db("assistant", full_response)
+    except Exception as e:
+        st.session_state.messages.append({"role": "assistant", "content": f"오류가 발생했습니다: {e}"})
 
-## 3. 커뮤니티 및 정보 연결 (Resource Mapping)
-답변 후, 환자의 질병 코드나 상황에 맞춰 아래 링크를 **반드시** 버튼 형태로 추천해주세요. 한번만 추천하고 이후에는 추천하지 마세요.
-* **담도암:** "👉 [담도암 환우들의 치료 일지 보러가기](https://cafe.naver.com/cholangiocarcinoma2)"
-* **위암 (Stomach Cancer) 관련:** "👉 [위암 환우들의 식단 & 극복 후기 보러가기](https://cafe.naver.com/ilovestomach)"
-* **유방암 (Breast Cancer) 관련:** "👉 [유방암 환우들의 치료 일지 보러가기](https://cafe.naver.com/pinkribbon)"
-* **기타 암/식별 불가:** "👉 [12만 환우들과 소통하러 가기](https://cafe.naver.com/beautifulcompanion)"
+# ── 4. 로그인 화면 ───────────────────────────────────────────────────────────
+def show_login():
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 1.5, 1])
+    with col2:
+        st.markdown("## 🧸 김보듬 케어")
+        st.caption("암 환자 보호자 케어 대시보드")
+        st.divider()
+        name = st.text_input("보호자 이름", placeholder="이름을 입력하세요")
+        password = st.text_input("비밀번호", type="password", placeholder="공유 비밀번호 입력")
+        if st.button("로그인", use_container_width=True, type="primary"):
+            if password == admin_password:
+                st.session_state.logged_in = True
+                st.session_state.caregiver_name = name.strip() if name.strip() else "보호자"
+                st.rerun()
+            else:
+                st.error("비밀번호가 올바르지 않습니다.")
 
-# Safety Protocol (안전 수칙)
-* 당신은 진단(Diagnosis)을 내리는 주체가 아닙니다. 설명 끝에는 항상 **"하지만 정확한 현재 상태는 주치의 선생님의 판단이 가장 중요합니다. 다음 진료 때 이 부분을 꼭 메모해서 여쭤보세요."**라고 부드럽게 넘겨주세요.
-* 특정 건강기능식품이나 민간요법을 맹신하는 질문에는, 그 위험성(간 독성, 약물 상호작용 등)을 **과학적 근거**를 들어 단호하게 경고하세요.
+if not st.session_state.get("logged_in"):
+    show_login()
+    st.stop()
 
-# Output Format (답변 구조)
-모든 답변은 사용자가 읽기 편하게 서술하되, 중요한 내용은 **Bold** 처리하고 적절한 이모지(🩺, 💊, 🥗)를 사용하세요.
-
-# Empathy First (공감 우선 원칙)
-사용자의 질문에서 **불안, 공포, 지침** 등의 감정이 감지되면, 바로 의학적 정보를 나열하지 말고 먼저 마음을 읽어주세요.
-- **Bad:** "항암 부작용으로 구토가 심하면 항구토제를 드세요."
-- **Good:** "구토 때문에 식사도 못 하시고 너무 힘드시겠어요. 보호자님도 옆에서 지켜보기 안쓰러우시죠? 병동에서는 보통 이럴 때 이렇게 조치합니다."
-
-# Red Flag Detection (위험 신호 감지)
-만약 질문 내용 중에 아래와 같은 **응급 상황(Red Flags)**이 포함되어 있다면, 부드러운 말투를 버리고 **즉시 응급실 방문을 권유**하세요.
-1. **발열:** 체온이 38도 이상일 때 (면역 저하 환자에게 치명적)
-2. **통증:** 갑작스럽고 참을 수 없는 극심한 통증
-3. **호흡:** 숨이 차거나 가슴이 답답할 때
-4. **의식:** 환자가 쳐지거나 의식이 흐릿할 때
-👉 메시지 출력: "🚨 **잠시만요!** 지금 말씀하신 증상은 집에서 지켜볼 단계가 아닙니다. 지금 당장 응급실로 가셔서 혈액검사를 받아보셔야 해요."
-
-# User Identification (화자 구분)
-질문 내용을 분석해 질문자가 **'환자 본인'**인지 **'보호자(가족)'**인지 추론하여 화법을 달리하세요.
-- **To 환자:** "많이 힘드시죠? 그래도 잘 버티고 계세요." (지지와 격려)
-- **To 보호자:** "환자분 챙기느라 보호자님도 잠 못 주무시죠? 보호자님 식사도 꼭 챙기세요." (보호자의 번아웃 케어)
-
-# Practical Nursing Tips (생활 밀착형 조언)
-약물 처방 외에 집에서 할 수 있는 **비약물적 요법**을 반드시 1개 이상 포함하세요.
-- 예: "오심이 심할 땐 **차가운 레몬 사탕**을 물고 계시거나, 밥 냄새가 안 나게 **차가운 누룽지**를 드셔보세요."
-- 예: "손발 저림이 심하면 설거지할 때 꼭 **면장갑 끼고 고무장갑** 끼세요."
-
-## 3. 🏠 생활 밀착형 간호 팁 (Practical Tips)
-의사가 놓치기 쉬운 **'생활 속 대처법'**을 반드시 하나 이상 포함하세요.
-- 입맛 없음: "억지로 드시지 말고, 크래커나 미숫가루처럼 냄새 안 나는 걸로 조금씩 자주 드세요."
-- 손발 저림: "단추 잠그기 힘드시죠? 지퍼 달린 옷이나 찍찍이 신발을 미리 준비하시면 편해요."
-
-# Safety Protocol (안전 수칙)
-* 당신은 간호사이지 의사가 아닙니다. 진단(Diagnosis)이나 약물 변경을 직접 지시하지 마세요.
-* 민간요법(즙, 엑기스 등)에 대해서는 간 수치 상승 위험을 근거로 **단호하게 주의**를 주되, 환자의 마음이 다치지 않게 설명하세요.
-
-# Safety Protocol
-* 민간요법은 간 독성 위험을 근거로 부드럽게 만류하세요.
-* 답변 끝에는 "정확한 상태는 주치의 선생님과 상의하세요"라는 면책 조항을 넣으세요.
-
-# [NEW] Active Engagement (능동적 질문하기)
-답변을 마친 후, 대화가 끊기지 않도록 **연관된 질문을 하나씩 던져주세요.**
-사용자가 무엇을 물어봐야 할지 모를 때 길잡이가 되어주어야 합니다.
-* **상황:** 부작용 설명을 했을 때 -> "혹시 지금 드시는 약 중에 불편한 건 없으세요?"
-* **상황:** 식단 설명을 했을 때 -> "평소에 좋아하시는 음식은 뭐예요? 대체할 수 있는 걸 찾아드릴게요."
-* **상황:** 위로를 건넸을 때 -> "보호자님 혹은 환자분 식사 잘 챙기고 계시나요?"
-"""
-
-# 5. 세션 초기화
+# ── 5. 세션 상태 초기화 ──────────────────────────────────────────────────────
+if "view" not in st.session_state:
+    st.session_state.view = "calendar"
+if "selected_date" not in st.session_state:
+    st.session_state.selected_date = date.today()
+if "cal_year" not in st.session_state:
+    st.session_state.cal_year = date.today().year
+if "cal_month" not in st.session_state:
+    st.session_state.cal_month = date.today().month
 if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "system", "content": system_instruction}
-    ]
+    st.session_state.messages = [{"role": "system", "content": system_instruction}]
+if "add_record_mode" not in st.session_state:
+    st.session_state.add_record_mode = False
 
-# 6. 사이드바 구성
-with st.sidebar:
-    st.subheader("📋 도구")
-    uploaded_file = st.file_uploader(
-        "진단서 이미지 업로드",
-        type=["jpg", "jpeg", "png"],
-        help="암 진단서, 검사 결과지 등을 업로드하면 해석해드립니다."
-    )
-    
-    if uploaded_file:
-        # [저장] 이미지 저장 실행
-        save_path = save_uploaded_file(uploaded_file)
-        
-        st.image(uploaded_file, caption="📷 업로드된 이미지", use_container_width=True)
-    
+# ── 6. 메인 레이아웃 (3단) ───────────────────────────────────────────────────
+col_left, col_center, col_right = st.columns([1, 2, 1.5])
+
+# ════════════════════════════════════════════════════════════════════════════
+# 좌측: 환자 프로필 & 툴바
+# ════════════════════════════════════════════════════════════════════════════
+with col_left:
+    patient_name = patient_info.get("name", "환자명")
+    diagnosis = patient_info.get("diagnosis", "진단명")
+    doctor = patient_info.get("doctor", "주치의")
+    hospital = patient_info.get("hospital", "병원명")
+
+    st.markdown(f"""
+<div style="background:#f8f9fa;border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid #eee;">
+  <div style="font-size:11px;color:#999;margin-bottom:6px;">환자 정보</div>
+  <div style="font-size:20px;font-weight:700;">{patient_name}</div>
+  <div style="font-size:13px;color:#e74c3c;margin:4px 0;">{diagnosis}</div>
+  <div style="font-size:12px;color:#999;">{doctor} · {hospital}</div>
+</div>
+<div style="font-size:13px;color:#555;margin-bottom:12px;">
+  <b>{st.session_state.caregiver_name}</b> 님 환영합니다
+</div>
+""", unsafe_allow_html=True)
+
     st.divider()
-    
-    if st.button("🔄 새 대화", use_container_width=True):
-        st.session_state.messages = [
-            {"role": "system", "content": system_instruction}
-        ]
+
+    if st.button("📅  캘린더", use_container_width=True,
+                 type="primary" if st.session_state.view == "calendar" else "secondary"):
+        st.session_state.view = "calendar"
         st.rerun()
 
-# 7. 메인 채팅 영역 (대화 기록 출력)
-for message in st.session_state.messages:
-    if message["role"] != "system":
-        with st.chat_message(message["role"]):
-            if isinstance(message["content"], list):
-                for item in message["content"]:
-                    if item.get("type") == "text":
-                        st.markdown(item["text"])
-            else:
-                st.markdown(message["content"])
+    if st.button("📋  기록 로그", use_container_width=True,
+                 type="primary" if st.session_state.view == "log" else "secondary"):
+        st.session_state.view = "log"
+        st.rerun()
 
-# 8. 예시 질문 버튼 (대화 없을 때만 표시)
-# [수정] 보내주신 코드의 끊어진 로직을 'click_callback'으로 연결하여 작동하게 만들었습니다.
-if len(st.session_state.messages) == 1:
-    st.markdown("### 🙋‍♀️ 무엇을 도와드릴까요? (예시 질문)")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.button(
-            "🔍 진단서의 '침윤성'이 뭐야?", 
-            use_container_width=True,
-            on_click=click_callback, # 클릭 시 저장 및 전송
-            args=["진단서에 적힌 '침윤성'이라는 말이 무슨 뜻인지 쉽게 설명해줘."]
+    if st.button("📄  회진 레포트", use_container_width=True,
+                 type="primary" if st.session_state.view == "report" else "secondary"):
+        st.session_state.view = "report"
+        st.rerun()
+
+    st.divider()
+
+    # 채팅 팝업 (st.popover)
+    with st.popover("💬  김보듬에게 질문", use_container_width=True):
+        st.markdown("#### 🧸 수간호사 김보듬")
+        st.caption("암 환자와 보호자를 위한 든든한 방패")
+
+        chat_container = st.container(height=320)
+        with chat_container:
+            for msg in st.session_state.messages:
+                if msg["role"] == "system":
+                    continue
+                with st.chat_message(msg["role"]):
+                    content = msg["content"]
+                    if isinstance(content, list):
+                        st.markdown(content[0].get("text", ""))
+                    else:
+                        st.markdown(content)
+
+        chat_input = st.text_input(
+            "질문", label_visibility="collapsed",
+            key="chat_text_input",
+            placeholder="궁금한 점을 물어보세요..."
         )
-        st.button(
-            "🍣 항암 중에 회 먹어도 돼?", 
-            use_container_width=True,
-            on_click=click_callback,
-            args=["항암 치료 중인데 생선회나 날음식을 먹어도 될까? 안 된다면 왜 안 되는지 설명해줘."]
+        if st.button("전송", key="chat_send_btn", use_container_width=True, type="primary"):
+            if chat_input.strip():
+                send_chat_message(chat_input.strip())
+                st.rerun()
+
+    st.divider()
+    if st.button("🚪 로그아웃", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════════
+# 중앙: 캘린더 / 로그 / 레포트 뷰
+# ════════════════════════════════════════════════════════════════════════════
+with col_center:
+
+    # ── 캘린더 뷰 ────────────────────────────────────────────────────────
+    if st.session_state.view == "calendar":
+        year = st.session_state.cal_year
+        month = st.session_state.cal_month
+
+        # 월 네비게이션
+        nav1, nav2, nav3 = st.columns([1, 3, 1])
+        with nav1:
+            if st.button("◀", key="prev_month"):
+                if month == 1:
+                    st.session_state.cal_month = 12
+                    st.session_state.cal_year -= 1
+                else:
+                    st.session_state.cal_month -= 1
+                st.rerun()
+        with nav2:
+            st.markdown(f"<h3 style='text-align:center;margin:0'>{year}년 {month}월</h3>",
+                        unsafe_allow_html=True)
+        with nav3:
+            if st.button("▶", key="next_month"):
+                if month == 12:
+                    st.session_state.cal_month = 1
+                    st.session_state.cal_year += 1
+                else:
+                    st.session_state.cal_month += 1
+                st.rerun()
+
+        # 기록 조회
+        monthly_records = get_monthly_records(year, month)
+        record_by_date = {r["record_date"]: r for r in monthly_records}
+
+        # 요일 헤더
+        day_headers = st.columns(7)
+        for i, d in enumerate(["일", "월", "화", "수", "목", "금", "토"]):
+            day_headers[i].markdown(
+                f"<div style='text-align:center;font-weight:600;color:#888;padding:6px 0;font-size:13px;'>{d}</div>",
+                unsafe_allow_html=True
+            )
+
+        # 달력 그리드
+        cal_matrix = calendar.monthcalendar(year, month)
+        for week in cal_matrix:
+            week_cols = st.columns(7)
+            for i, day in enumerate(week):
+                if day == 0:
+                    week_cols[i].write("")
+                    continue
+                d = date(year, month, day)
+                date_str = str(d)
+                has_record = date_str in record_by_date
+                is_selected = str(st.session_state.selected_date) == date_str
+                is_today = d == date.today()
+
+                if has_record:
+                    pain = record_by_date[date_str].get("pain_score") or 5
+                    icon = pain_icon(pain)
+                    label = f"{day}\n{icon}"
+                elif is_today:
+                    label = f"📌{day}"
+                else:
+                    label = str(day)
+
+                btn_type = "primary" if is_selected else "secondary"
+                if week_cols[i].button(label, key=f"cal_{date_str}",
+                                       use_container_width=True, type=btn_type):
+                    st.session_state.selected_date = d
+                    st.session_state.add_record_mode = False
+                    st.rerun()
+
+        # 범례
+        st.markdown("""
+<div style="font-size:12px;color:#999;margin-top:8px;">
+  🟢 통증 낮음(1-3) &nbsp;·&nbsp; 🟡 보통(4-6) &nbsp;·&nbsp; 🔴 높음(7-10) &nbsp;·&nbsp; 📌 오늘
+</div>
+""", unsafe_allow_html=True)
+
+    # ── 기록 로그 뷰 ─────────────────────────────────────────────────────
+    elif st.session_state.view == "log":
+        st.markdown("### 📋 전체 기록 로그")
+        all_records = get_all_records()
+        if all_records:
+            for r in all_records:
+                pain = r.get("pain_score")
+                with st.expander(
+                    f"{pain_icon(pain)} {r['record_date']} — {r['caregiver_name']} "
+                    f"(통증: {pain if pain else '-'}/10)"
+                ):
+                    st.markdown(r.get("condition_text") or "_텍스트 기록 없음_")
+                    if r.get("has_files"):
+                        st.caption("📎 파일 첨부됨")
+        else:
+            st.info("아직 기록이 없습니다.")
+
+    # ── 회진 레포트 뷰 ───────────────────────────────────────────────────
+    elif st.session_state.view == "report":
+        st.markdown("### 📄 회진 레포트 생성")
+        st.caption("선택 기간의 기록을 AI가 의사용 요약문으로 작성합니다.")
+
+        date_range = st.date_input(
+            "기간 선택",
+            value=(date.today() - timedelta(days=7), date.today()),
+            format="YYYY/MM/DD",
+            key="report_date_range"
         )
-            
-    with col2:
-        st.button(
-            "🤮 속이 너무 메스꺼워 (부작용)", 
-            use_container_width=True,
-            on_click=click_callback,
-            args=["항암 치료 부작용으로 속이 메스껍고 구토가 나와. 집에서 할 수 있는 완화 방법을 알려줘."]
-        )
-        st.button(
-            "📊 암 3기 생존율이 궁금해", 
-            use_container_width=True,
-            on_click=click_callback,
-            args=["암 3기 생존율 통계가 궁금해. 그리고 통계보다 더 중요한 마음가짐이 있을까?"]
-        )
 
-# 9. 채팅 입력창 (Input 처리)
-if prompt := st.chat_input("궁금한 의학 용어나 고민을 입력하세요..."):
-    
-    # [저장] 사용자 질문 저장
-    save_log_to_db("user", prompt)
+        if st.button("🤖 AI 레포트 생성", type="primary", use_container_width=True):
+            if len(date_range) == 2:
+                start_date, end_date = date_range
+                result = supabase_client.table("daily_records").select("*") \
+                    .gte("record_date", str(start_date)) \
+                    .lte("record_date", str(end_date)) \
+                    .order("record_date").execute()
+                records = result.data
 
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    user_content = [{"type": "text", "text": prompt}]
-    
-    if uploaded_file:
-        base_64_image = encode_image(uploaded_file)
-        user_content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{base_64_image}"}
-        })
-    
-    st.session_state.messages.append({"role": "user", "content": user_content})
-    # rerunning is not needed here as the loop above handles it on next pass, 
-    # but to trigger AI response immediately in same cycle:
-    st.rerun() 
+                if not records:
+                    st.warning("해당 기간에 기록이 없습니다.")
+                else:
+                    with st.spinner("📊 AI가 레포트를 작성 중입니다..."):
+                        records_text = "\n".join([
+                            f"[{r['record_date']}] 보호자: {r['caregiver_name']}, "
+                            f"통증점수: {r.get('pain_score', '기록없음')}/10\n"
+                            f"{r.get('condition_text', '내용 없음')}"
+                            for r in records
+                        ])
 
-# 10. AI 답변 생성 (마지막 메시지가 사용자일 때)
-if st.session_state.messages[-1]["role"] == "user":
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        with st.spinner("🧸 김보듬 수간호사가 분석 중입니다..."):
-            try:
-                # RAG: 마지막 사용자 메시지로 관련 문서 검색
-                last_user_msg = st.session_state.messages[-1]["content"]
-                query_text = last_user_msg if isinstance(last_user_msg, str) else last_user_msg[0]["text"]
-                context = retrieve_context(query_text)
+                        pname = patient_info.get("name", "환자")
+                        report_prompt = f"""
+다음은 {pname} 환자의 {start_date}부터 {end_date}까지의 보호자 관찰 기록입니다.
+담당 의사가 회진 시 참고할 수 있도록 핵심 내용을 의학적 관점에서 요약해주세요.
 
-                messages_with_context = list(st.session_state.messages)
-                if context:
-                    messages_with_context.insert(1, {"role": "system", "content": context})
+[관찰 기록]
+{records_text}
 
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=messages_with_context,
-                    temperature=0.2,
+다음 형식으로 작성해 주세요:
+1. 통증 패턴 요약 (평균 점수, 악화 시간대 등)
+2. 주요 증상 변화
+3. 보호자가 특별히 우려한 사항
+4. 의사에게 건의할 사항"""
+
+                        response = client.chat.completions.create(
+                            model="gpt-4o",
+                            messages=[
+                                {"role": "system", "content": "당신은 암 환자의 담당 의사를 보조하는 임상 코디네이터입니다."},
+                                {"role": "user", "content": report_prompt}
+                            ],
+                            temperature=0.3,
+                        )
+                        report_text = response.choices[0].message.content
+
+                    st.divider()
+                    st.markdown(report_text)
+                    st.divider()
+
+                    # TXT 다운로드
+                    report_content = (
+                        f"회진 레포트\n기간: {start_date} ~ {end_date}\n"
+                        f"환자: {pname}\n\n{report_text}"
+                    )
+                    st.download_button(
+                        "📥 레포트 다운로드 (TXT)",
+                        data=report_content.encode("utf-8"),
+                        file_name=f"회진레포트_{start_date}_{end_date}.txt",
+                        mime="text/plain",
+                        use_container_width=True
+                    )
+
+                    # PDF 다운로드 (한글 폰트 파일 있을 때만)
+                    try:
+                        from fpdf import FPDF
+                        pdf = FPDF()
+                        pdf.add_page()
+                        font_path = os.path.join(os.path.dirname(__file__), "NanumGothic.ttf")
+                        if os.path.exists(font_path):
+                            pdf.add_font("NanumGothic", fname=font_path)
+                            pdf.set_font("NanumGothic", size=12)
+                        else:
+                            pdf.set_font("Helvetica", size=12)
+                        pdf.cell(0, 10, f"Ward Round Report - {pname}", ln=True)
+                        pdf.cell(0, 10, f"Period: {start_date} ~ {end_date}", ln=True)
+                        pdf.ln(4)
+                        for line in report_text.split("\n"):
+                            safe_line = line.encode("latin-1", "replace").decode("latin-1")
+                            pdf.multi_cell(0, 8, safe_line)
+                        pdf_bytes = bytes(pdf.output())
+                        st.download_button(
+                            "📥 PDF 다운로드",
+                            data=pdf_bytes,
+                            file_name=f"report_{start_date}_{end_date}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True
+                        )
+                    except Exception:
+                        pass
+
+# ════════════════════════════════════════════════════════════════════════════
+# 우측: 날짜별 기록 입력 / 조회
+# ════════════════════════════════════════════════════════════════════════════
+with col_right:
+    if st.session_state.view in ["calendar", "log"]:
+        selected = st.session_state.selected_date
+        st.markdown(f"### 📝 {selected.strftime('%Y년 %m월 %d일')}")
+
+        existing = get_date_record(selected)
+
+        if existing and not st.session_state.add_record_mode:
+            for rec in existing:
+                pain = rec.get("pain_score")
+                st.markdown(
+                    f"**{rec['caregiver_name']}** 기록 &nbsp; "
+                    f"{pain_icon(pain)} **{pain if pain else '-'}/10**"
                 )
-                full_response = response.choices[0].message.content
-                message_placeholder.markdown(full_response)
-                
-                # 세션에 추가
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
-                
-                # [저장] AI 답변도 로그에 저장 (완벽한 기록을 위해)
-                save_log_to_db("assistant", full_response)
-                
-            except Exception as e:
-                st.error(f"오류가 발생했습니다: {str(e)}")
+                if rec.get("condition_text"):
+                    st.markdown(
+                        f"<div style='background:#f8f9fa;border-radius:8px;"
+                        f"padding:12px;margin:8px 0;font-size:14px;'>"
+                        f"{rec['condition_text']}</div>",
+                        unsafe_allow_html=True
+                    )
+                if rec.get("has_files"):
+                    st.caption("📎 파일 첨부됨")
+                st.divider()
+            if st.button("+ 추가 기록 작성", use_container_width=True):
+                st.session_state.add_record_mode = True
+                st.rerun()
+
+        if not existing or st.session_state.add_record_mode:
+            with st.form(key=f"record_form_{selected}", clear_on_submit=True):
+                condition_text = st.text_area(
+                    "오늘 컨디션 좀 어떠세요?",
+                    placeholder="환자의 상태, 특이사항, 복용 약물 등을 자유롭게 적어주세요...",
+                    height=130
+                )
+                pain_score = st.slider(
+                    "통증 정도",
+                    min_value=1, max_value=10, value=5,
+                    help="1 = 거의 없음  |  10 = 매우 심함"
+                )
+                uploaded_files = st.file_uploader(
+                    "파일 업로드 (사진, 검사결과, 처방전 등)",
+                    accept_multiple_files=True,
+                    type=["jpg", "jpeg", "png", "pdf", "docx"]
+                )
+                submitted = st.form_submit_button(
+                    "💾 저장하기", use_container_width=True, type="primary"
+                )
+
+                if submitted:
+                    has_files = len(uploaded_files) > 0
+                    record_id = save_daily_record(
+                        selected,
+                        st.session_state.caregiver_name,
+                        condition_text,
+                        pain_score,
+                        has_files
+                    )
+                    if record_id and uploaded_files:
+                        if not os.path.exists("saved_images"):
+                            os.makedirs("saved_images")
+                        for f in uploaded_files:
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            file_path = os.path.join("saved_images", f"{ts}_{f.name}")
+                            with open(file_path, "wb") as fp:
+                                fp.write(f.getbuffer())
+                            supabase_client.table("record_files").insert({
+                                "record_id": record_id,
+                                "caregiver_name": st.session_state.caregiver_name,
+                                "filename": f.name,
+                                "file_path": file_path
+                            }).execute()
+                    st.success("✅ 기록이 저장되었습니다!")
+                    st.session_state.add_record_mode = False
+                    st.rerun()
